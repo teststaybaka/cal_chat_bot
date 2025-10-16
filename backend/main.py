@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from uuid import uuid4
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+import chainlit as cl
 import json
 import asyncio
 import httpx
@@ -10,7 +11,6 @@ import os
 load_dotenv()
 openaiClient = AsyncOpenAI()
 
-# 1. Define a list of callable tools for the model
 tools = [
     {
         "type": "function",
@@ -30,7 +30,7 @@ tools = [
     {
         "type": "function",
         "name": "create_booking",
-        "description": "Create a new booking for a given date.",
+        "description": "Create a new booking for a given start time with 30 min duration.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -141,22 +141,15 @@ async def list_all_upcoming_bookings(chatList, callId, attendeeEmail):
         "call_id": callId,
         "output": json.dumps(bookings)
     })
-    response = await openaiClient.responses.create(
-        model="gpt-5",
-        instructions="Respond to the user based on the bookings listed. If there are no bookings, inform the user. If there are bookings, summarize them.",
-        tools=tools,
-        input=chatList,
-    )
-    chatList += response.output
-    return response.output_text
 
-async def create_booking(chatList, callId, attendeeEmail, attendeeName, startTime, timeZone):
+async def create_booking(chatList, callId, attendeeEmail, attendeeName, startTime, timeZone, phoneNumber=None):
     url = "https://api.cal.com/v2/bookings"
     data = {
         "attendee": {
           "name": attendeeName,
           "email": attendeeEmail,
           "timeZone": timeZone,
+          "phoneNumber": phoneNumber,
         },
         "start": startTime,
         "eventTypeId": 3666489,
@@ -169,14 +162,6 @@ async def create_booking(chatList, callId, attendeeEmail, attendeeName, startTim
         "call_id": callId,
         "output": json.dumps(booking)
     })
-    response = await openaiClient.responses.create(
-        model="gpt-5",
-        instructions="Respond to the user based on the booking created. If the booking was successful, confirm the details to the user. If there was an error, inform the user.",
-        tools=tools,
-        input=chatList,
-    )
-    chatList += response.output
-    return response.output_text
 
 async def look_up_first_booking(chatList, callId, attendeeEmail, scheduledStartTime):
     url = "https://api.cal.com/v2/bookings"
@@ -194,14 +179,6 @@ async def look_up_first_booking(chatList, callId, attendeeEmail, scheduledStartT
         "call_id": callId,
         "output": json.dumps(bookings)
     })
-    response = await openaiClient.responses.create(
-        model="gpt-5",
-        instructions="Respond to the user based on the first booking found. If there are no bookings, inform the user. If there is a booking, summarize it.",
-        tools=tools,
-        input=chatList,
-    )
-    chatList += response.output
-    return response.output_text
 
 async def cancel_first_booking(chatList, callId, attendeeEmail, scheduledStartTime):
     # First, look up the first booking
@@ -221,13 +198,7 @@ async def cancel_first_booking(chatList, callId, attendeeEmail, scheduledStartTi
           "call_id": callId,
           "output": json.dumps(bookings)
       })
-      response = await openaiClient.responses.create(
-          model="gpt-5",
-          instructions="Respond to the user that there are no bookings to cancel.",
-          tools=tools,
-          input=chatList,
-      )
-      return response.output_text
+      return
 
     bookingUid = bookings["data"][0]["uid"]
     cancel_url = f"https://api.cal.com/v2/bookings/{bookingUid}/cancel"
@@ -242,14 +213,6 @@ async def cancel_first_booking(chatList, callId, attendeeEmail, scheduledStartTi
         "call_id": callId,
         "output": json.dumps(cancellationResult)
     })
-    response = await openaiClient.responses.create(
-        model="gpt-5",
-        instructions="Respond to the user based on the booking cancellation. Confirm the cancellation details to the user.",
-        tools=tools,
-        input=chatList,
-    )
-    chatList += response.output
-    return response.output_text
 
 async def reschedule_first_booking(chatList, callId, attendeeEmail, scheduledStartTime, newStartTime):
     # First, look up the first booking
@@ -269,13 +232,7 @@ async def reschedule_first_booking(chatList, callId, attendeeEmail, scheduledSta
           "call_id": callId,
           "output": json.dumps(bookings)
       })
-      response = await openaiClient.responses.create(
-          model="gpt-5",
-          instructions="Respond to the user that there are no bookings to reschedule.",
-          tools=tools,
-          input=chatList,
-      )
-      return response.output_text
+      return
 
     bookingUid = bookings["data"][0]["uid"]
     reschedule_url = f"https://api.cal.com/v2/bookings/{bookingUid}/reschedule"
@@ -291,62 +248,52 @@ async def reschedule_first_booking(chatList, callId, attendeeEmail, scheduledSta
         "call_id": callId,
         "output": json.dumps(rescheduleResult)
     })
-    response = await openaiClient.responses.create(
-        model="gpt-5",
-        instructions="Respond to the user based on the booking rescheduling. Confirm the new booking details to the user.",
-        tools=tools,
-        input=chatList,
-    )
-    chatList += response.output
-    return response.output_text
 
-app = FastAPI()
 sessions = {}
 
-@app.post("/")
-async def chat(request: Request):
-  body = await request.json()
-  if "sessionId" not in body:
-    sessionId = str(uuid4())
+@cl.on_chat_start
+async def on_start():
+  await cl.Message(content="Hi! I can help you with your calendar bookings!").send()
+
+@cl.on_message
+async def on_message(message: cl.Message):
+  sessionId = cl.user_session.get("id")  # auto unique session id
+  if sessionId not in sessions:
     sessions[sessionId] = {"chatList": []}
-    session = sessions[sessionId]
-  else:
-    sessionId = body.get("sessionId")
-    session = sessions[sessionId]
-
+  session = sessions[sessionId]
   chatList = session["chatList"]
-  message = body.get("message")
-  chatList.append({"role": "user", "content": message})
+  chatList.append({"role": "user", "content": message.content})
 
-  response = await openaiClient.responses.create(
-    model="gpt-5",
-    tools=tools,
-    instructions="You are a helpful assistant that helps people manage their calendar bookings. You can call functions to list, create, cancel, and reschedule bookings as needed. If information is missing, ask the user for more details before calling a function. Before cancelling or rescheduling a booking, make sure to get confirm the booking details with the user.",
-    input=chatList,
-  )
-  chatList += response.output
+  while True:
+    response = await openaiClient.responses.create(
+      model="gpt-5",
+      tools=tools,
+      instructions="You are a helpful assistant that helps people manage their calendar bookings. You can call functions to list, create, cancel, and reschedule bookings as needed. If information is missing, ask the user for more details before calling a function. Before cancelling or rescheduling a booking, make sure to get confirm the booking details with the user. If you have provided a final response to the user, stop and do not call any more functions.",
+      input=chatList,
+    )
+    chatList += response.output
 
-  function_call_found = False
-  for item in response.output:
-    if item.type == "function_call":
-      function_call_found = True
-      if item.name == "list_all_upcoming_bookings":
-        args = json.loads(item.arguments)
-        responseText = await list_all_upcoming_bookings(chatList, item.call_id, **args)
-      elif item.name == "create_booking":
-        args = json.loads(item.arguments)
-        responseText = await create_booking(chatList, item.call_id, **args)
-      elif item.name == "look_up_first_booking":
-        args = json.loads(item.arguments)
-        responseText = await look_up_first_booking(chatList, item.call_id, **args)
-      elif item.name == "cancel_first_booking":
-        args = json.loads(item.arguments)
-        responseText = await cancel_first_booking(chatList, item.call_id, **args)
-      elif item.name == "reschedule_first_booking":
-        args = json.loads(item.arguments)
-        responseText = await reschedule_first_booking(chatList, item.call_id, **args)
+    function_call_found = False
+    for item in response.output:
+      if item.type == "function_call":
+        function_call_found = True
+        if item.name == "list_all_upcoming_bookings":
+          args = json.loads(item.arguments)
+          await list_all_upcoming_bookings(chatList, item.call_id, **args)
+        elif item.name == "create_booking":
+          args = json.loads(item.arguments)
+          await create_booking(chatList, item.call_id, **args)
+        elif item.name == "look_up_first_booking":
+          args = json.loads(item.arguments)
+          await look_up_first_booking(chatList, item.call_id, **args)
+        elif item.name == "cancel_first_booking":
+          args = json.loads(item.arguments)
+          await cancel_first_booking(chatList, item.call_id, **args)
+        elif item.name == "reschedule_first_booking":
+          args = json.loads(item.arguments)
+          await reschedule_first_booking(chatList, item.call_id, **args)
+    if not function_call_found:
+      responseText = response.output_text
       break
-  if not function_call_found:
-    responseText = response.output_text
   print("chats:", chatList)
-  return {"response": responseText, "sessionId": sessionId}
+  await cl.Message(content=responseText).send()
